@@ -24,10 +24,7 @@
 #include "IODataQueueClientPrivate.h"
 #include <IOKit/IODataQueueShared.h>
 
-#include <mach/message.h>
-#include <mach/mach_port.h>
-#include <mach/port.h>
-#include <mach/mach_init.h>
+#include <mach/mach.h>
 #include <IOKit/OSMessageNotification.h>
 #include <libkern/OSAtomic.h>
 
@@ -39,11 +36,12 @@ Boolean IODataQueueDataAvailable(IODataQueueMemory *dataQueue)
     return (dataQueue && (dataQueue->head != dataQueue->tail));
 }
 
-IODataQueueEntry *__IODataQueuePeek(IODataQueueMemory *dataQueue, uint64_t qSize)
+IODataQueueEntry *__IODataQueuePeek(IODataQueueMemory *dataQueue, uint64_t qSize, size_t *entrySize)
 {
     IODataQueueEntry *entry = 0;
     UInt32            headOffset;
     UInt32            tailOffset;
+    size_t            size = 0;
     
     if (!dataQueue) {
         return NULL;
@@ -77,8 +75,24 @@ IODataQueueEntry *__IODataQueuePeek(IODataQueueMemory *dataQueue, uint64_t qSize
             // Note: wrapping even with the UINT32_MAX checks, as we have to support
             // queueSize of UINT32_MAX
             entry = dataQueue->queue;
+            
+            size = entry ? entry->size : 0;
+            
+            if ((size > UINT32_MAX - DATA_QUEUE_ENTRY_HEADER_SIZE) ||
+                (size + DATA_QUEUE_ENTRY_HEADER_SIZE > queueSize)) {
+                return NULL;
+            }
+            
+            if (entrySize) {
+                *entrySize = size;
+            }
+            
         } else {
             entry = head;
+            
+            if (entrySize) {
+                *entrySize = headSize;
+            }
         }
     }
     
@@ -87,12 +101,14 @@ IODataQueueEntry *__IODataQueuePeek(IODataQueueMemory *dataQueue, uint64_t qSize
 
 IODataQueueEntry *IODataQueuePeek(IODataQueueMemory *dataQueue)
 {
-    return __IODataQueuePeek(dataQueue, 0);
+    size_t entrySize = 0;
+    
+    return __IODataQueuePeek(dataQueue, 0, &entrySize);
 }
 
-IODataQueueEntry *_IODataQueuePeek(IODataQueueMemory *dataQueue, uint64_t queueSize)
+IODataQueueEntry *_IODataQueuePeek(IODataQueueMemory *dataQueue, uint64_t queueSize,  size_t *entrySize)
 {
-    return __IODataQueuePeek(dataQueue, queueSize);
+    return __IODataQueuePeek(dataQueue, queueSize, entrySize);
 }
 
 IOReturn
@@ -314,7 +330,7 @@ __IODataQueueEnqueue(IODataQueueMemory *dataQueue, uint64_t qSize, mach_msg_head
             // Send notification (via mach message) that data is now available.
             retVal = _IODataQueueSendDataAvailableNotification(dataQueue, msgh);
         }
-#if TARGET_IPHONE_SIMULATOR
+#if TARGET_OS_SIMULATOR
         else
         {
             retVal = _IODataQueueSendDataAvailableNotification(dataQueue, msgh);
@@ -422,6 +438,21 @@ IOReturn IODataQueueSetNotificationPort(IODataQueueMemory *dataQueue, mach_port_
     return kIOReturnSuccess;
 }
 
+static void
+__IODataQueueConsumeUnsentMessage(mach_msg_header_t *hdr)
+{
+    mach_port_t port = hdr->msgh_local_port;
+    if (MACH_PORT_VALID(port)) {
+        switch (MACH_MSGH_BITS_LOCAL(hdr->msgh_bits)) {
+            case MACH_MSG_TYPE_MOVE_SEND:
+            case MACH_MSG_TYPE_MOVE_SEND_ONCE:
+                mach_port_deallocate(mach_task_self(), port);
+                break;
+        }
+    }
+    mach_msg_destroy(hdr);
+}
+
 IOReturn _IODataQueueSendDataAvailableNotification(IODataQueueMemory *dataQueue, mach_msg_header_t *msgh)
 {
     kern_return_t kr;
@@ -442,7 +473,11 @@ IOReturn _IODataQueueSendDataAvailableNotification(IODataQueueMemory *dataQueue,
     
     kr = mach_msg(&header, MACH_SEND_MSG | MACH_SEND_TIMEOUT, header.msgh_size, 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
     switch(kr) {
+        case MACH_SEND_INVALID_DEST:
         case MACH_SEND_TIMED_OUT:    // Notification already sent
+            // Clean up pseudo-receive
+            __IODataQueueConsumeUnsentMessage(&header);
+            break;
         case MACH_MSG_SUCCESS:
             break;
         default:
